@@ -1,209 +1,174 @@
 """
-Trackpad tester for two_motor_control.py
+A joystick drives two motors (Sketch 2) -- Raspberry Pi 4 version.
 
-Your trackpad stands in for the joystick. Move the pointer around the
-square pad: left/right is the X axis (steering), up/down is the Y axis
-(up = forward). The window shows what mix() and motor_signals() from
-two_motor_control.py would send to each motor.
+The Y axis sets forward and back. The X axis steers. Mixing the two gives
+each motor its own speed:  left = y + x,  right = y - x.
 
-Keep this file in the same folder as two_motor_control.py, then run:
+This version runs entirely on the Raspberry Pi -- no Arduino needed. The Pi
+drives the motor driver (L298N or similar) straight from its GPIO pins.
 
-    python two_motor_trackpad_test.py            # on screen only
-    python two_motor_trackpad_test.py --board    # also drive the real motors
+The Pi has no analog inputs, so the joystick is read through an MCP3008
+analog-to-digital converter (ADC) over SPI. The MCP3008 is 10-bit, so its
+readings run 0-1023, exactly like the Arduino's analogRead(). That means the
+mixing math below is unchanged from the Arduino version.
 
-Moving the pointer out of the window snaps back to center, like letting go
-of the joystick, so both motors stop.
+One-time setup:
+  1. Turn on SPI:  sudo raspi-config  >  Interface Options  >  SPI  >  Yes
+                   then reboot.
+  2. gpiozero comes with Raspberry Pi OS. If it's missing:
+                   sudo apt install python3-gpiozero
+  3. Run:          python3 two_motor_control_pi.py
+
+Wiring (BCM GPIO numbers, physical header pin in [brackets]):
+
+  MCP3008 (chip pin)        Raspberry Pi
+    VDD  (16), VREF (15)  ->  3.3V            [1]
+    AGND (14), DGND (9)   ->  GND             [6]
+    CLK  (13)             ->  GPIO11 / SCLK   [23]
+    DOUT (12)             ->  GPIO9  / MISO   [21]
+    DIN  (11)             ->  GPIO10 / MOSI   [19]
+    CS   (10)             ->  GPIO8  / CE0    [24]
+
+  Joystick
+    VCC (+5V)             ->  3.3V            [17]   <-- 3.3V, NOT 5V
+    GND                   ->  GND             [9]
+    VRx                   ->  MCP3008 CH0 (chip pin 1)
+    VRy                   ->  MCP3008 CH1 (chip pin 2)
+
+  Motor driver (L298N)
+    IN1 -> GPIO17 [11]     IN2 -> GPIO27 [13]     ENA -> GPIO12 [32]
+    IN3 -> GPIO22 [15]     IN4 -> GPIO23 [16]     ENB -> GPIO13 [33]
+    GND -> any Pi GND (the Pi and the driver MUST share ground)
+    Motor power (12V / VS) comes from a battery pack, never from the Pi.
+    Remove the ENA and ENB jumpers on the L298N so the Pi controls speed.
 """
 
-import sys
-import tkinter as tk
+import time
 
-try:
-    from two_motor_control import (
-        mix, motor_signals, connect, DEADZONE,
-        IN1, IN2, ENA, IN3, IN4, ENB,
-    )
-except ImportError:
-    sys.exit("Put this file in the same folder as two_motor_control.py.")
+# --- Pin Definitions (BCM GPIO numbers) ---
+# Joystick (MCP3008 input channels)
+VRX_CHANNEL = 0
+VRY_CHANNEL = 1
 
-WIDTH, HEIGHT = 780, 420
-PAD_LEFT, PAD_TOP, PAD_SIZE = 40, 70, 300     # the square joystick pad
-PANEL = 400                                   # left edge of the readouts
-BAR_LEFT, BAR_RIGHT = PANEL + 110, WIDTH - 140
-CENTER = 511
+# Motor A (Left)
+IN1 = 17
+IN2 = 27
+ENA = 12
+
+# Motor B (Right)
+IN3 = 22
+IN4 = 23
+ENB = 13
+
+# --- Constants ---
+DEADZONE = 80        # Ignore tiny joystick noise
+PWM_FREQUENCY = 500  # Hz, close to the Arduino's 490 Hz on pins 3 and 11
+LOOP_DELAY = 0.01    # seconds between updates, same as delay(10)
 
 
-def pointer_to_readings(px, py):
-    """Pointer position in the window -> (x_reading, y_reading), 0-1023.
+def constrain(value, low, high):
+    return max(low, min(high, value))
 
-    Left edge of the pad is X = 0, right edge is X = 1023.
-    Bottom edge is Y = 0, top edge is Y = 1023 (up = forward).
+
+def mix(x_reading, y_reading):
+    """Turn two 0-1023 joystick readings into (left_speed, right_speed).
+
+    Each speed runs from -511 (full reverse) to 511 (full forward).
     """
-    fx = (px - PAD_LEFT) / PAD_SIZE
-    fy = (PAD_TOP + PAD_SIZE - py) / PAD_SIZE
-    x_reading = max(0, min(1023, round(fx * 1023)))
-    y_reading = max(0, min(1023, round(fy * 1023)))
-    return x_reading, y_reading
+    # Center the readings around 0
+    x_val = x_reading - 511
+    y_val = y_reading - 511
+
+    # APPLY DEADZONE so small movements do nothing
+    if abs(x_val) < DEADZONE:
+        x_val = 0
+    if abs(y_val) < DEADZONE:
+        y_val = 0
+
+    # Stronger steering: amplify X by 1.2 (steering priority).
+    # Written as 12/10 so whole numbers stay exact; int() drops the
+    # fraction the same way the Arduino's int does.
+    x_val = int(x_val * 12 / 10)
+
+    # Mix joystick values for differential steering
+    left_speed = constrain(y_val + x_val, -511, 511)
+    right_speed = constrain(y_val - x_val, -511, 511)
+    return left_speed, right_speed
 
 
-def readings_to_pointer(x_reading, y_reading):
-    px = PAD_LEFT + x_reading / 1023 * PAD_SIZE
-    py = PAD_TOP + PAD_SIZE - y_reading / 1023 * PAD_SIZE
-    return px, py
+def motor_signals(speed):
+    """Turn one motor's speed (-511 to 511) into (in_a, in_b, pwm).
+
+    in_a and in_b are the two direction pins (1 = HIGH, 0 = LOW).
+    pwm is 0-255 for the enable pin.
+    """
+    if speed > 0:
+        in_a, in_b = 1, 0          # forward
+    elif speed < 0:
+        in_a, in_b = 0, 1          # reverse
+    else:
+        in_a, in_b = 0, 0          # stopped
+
+    # Map from -511/511 range to 0-255 PWM range
+    return in_a, in_b, abs(speed) // 2
 
 
-def describe(left_speed, right_speed):
-    """Plain-words result, like the table in the walkthrough."""
-    if left_speed == 0 and right_speed == 0:
-        return "Stopped"
-    if left_speed * right_speed < 0:
-        side = "right" if left_speed > 0 else "left"
-        return f"Spins {side} in place"
-    if left_speed == right_speed:
-        return "Drives straight" if left_speed > 0 else "Backs up"
-    if left_speed >= 0 and right_speed >= 0:
-        return "Curves right" if left_speed > right_speed else "Curves left"
-    return "Backs up while turning"
+def connect():
+    """Set up the joystick ADC and the motor pins.
 
+    Returns (read_joystick, drive, close):
+      read_joystick() -> (x_reading, y_reading), each 0-1023
+      drive(left_speed, right_speed) sends direction and PWM to both motors
+      close() releases all the GPIO pins
+    """
+    # Imported here (not at the top) so the trackpad tester can use mix()
+    # and motor_signals() on a laptop that doesn't have gpiozero.
+    from gpiozero import MCP3008, DigitalOutputDevice, PWMOutputDevice
 
-class Tester:
-    def __init__(self, root, use_board=False):
-        self.root = root
-        self.board = self.drive = None
-        self.last_sent = None
-        if use_board:
-            self.board, self.drive = connect()
+    # setup(): same roles as pinMode in the sketch
+    joy_x = MCP3008(channel=VRX_CHANNEL)
+    joy_y = MCP3008(channel=VRY_CHANNEL)
 
-        mode = "driving the real motors" if use_board else "screen only"
-        root.title(f"Two-motor trackpad tester ({mode})")
-        root.resizable(False, False)
+    left = (DigitalOutputDevice(IN1), DigitalOutputDevice(IN2),
+            PWMOutputDevice(ENA, frequency=PWM_FREQUENCY))
+    right = (DigitalOutputDevice(IN3), DigitalOutputDevice(IN4),
+             PWMOutputDevice(ENB, frequency=PWM_FREQUENCY))
 
-        c = self.canvas = tk.Canvas(root, width=WIDTH, height=HEIGHT,
-                                    bg="white", highlightthickness=0)
-        c.pack()
+    def read_joystick():
+        # gpiozero gives 0.0-1.0; scale back to 0-1023 like analogRead()
+        return round(joy_x.value * 1023), round(joy_y.value * 1023)
 
-        # Joystick pad, with the deadzone bands shaded
-        right, bottom = PAD_LEFT + PAD_SIZE, PAD_TOP + PAD_SIZE
-        c.create_rectangle(PAD_LEFT, PAD_TOP, right, bottom,
-                           fill="#eeeeee", outline="#bbbbbb")
-        lo_x, lo_y = readings_to_pointer(CENTER - DEADZONE + 1,
-                                         CENTER - DEADZONE + 1)
-        hi_x, hi_y = readings_to_pointer(CENTER + DEADZONE - 1,
-                                         CENTER + DEADZONE - 1)
-        c.create_rectangle(lo_x, PAD_TOP, hi_x, bottom,
-                           fill="#d5d5d5", outline="")
-        c.create_rectangle(PAD_LEFT, hi_y, right, lo_y,
-                           fill="#d5d5d5", outline="")
-        mid = PAD_LEFT + PAD_SIZE / 2
-        c.create_text(mid, 30, font=("Helvetica", 13), fill="#444",
-                      text="Move the pointer around the pad")
-        c.create_text(mid, PAD_TOP - 12, text="forward", fill="#666")
-        c.create_text(mid, bottom + 14, text="back", fill="#666")
-        c.create_text(PAD_LEFT - 6, PAD_TOP + PAD_SIZE / 2, text="left",
-                      fill="#666", angle=90, anchor="s")
-        c.create_text(right + 6, PAD_TOP + PAD_SIZE / 2, text="right",
-                      fill="#666", angle=270, anchor="s")
-        c.create_text(mid, bottom + 34, fill="#888",
-                      text="shaded bands = deadzone")
-        self.marker = c.create_oval(0, 0, 0, 0, fill="#222222", outline="")
+    def drive(left_speed, right_speed):
+        for speed, (pin_a, pin_b, enable) in ((left_speed, left),
+                                              (right_speed, right)):
+            in_a, in_b, pwm = motor_signals(speed)
+            pin_a.value = in_a
+            pin_b.value = in_b
+            enable.value = pwm / 255   # gpiozero PWM takes 0.0-1.0
 
-        # Readouts
-        self.result = c.create_text(PANEL, 85, anchor="w",
-                                    font=("Helvetica", 20, "bold"))
-        self.readings = c.create_text(PANEL, 118, anchor="w",
-                                      font=("Courier", 13), fill="#444")
-        self.left = self.make_motor(165, "LEFT MOTOR", ENA, IN1, IN2)
-        self.right = self.make_motor(285, "RIGHT MOTOR", ENB, IN3, IN4)
+    def close():
+        for device in (joy_x, joy_y, *left, *right):
+            device.close()
 
-        c.bind("<Motion>", lambda e: self.update(
-            *pointer_to_readings(e.x, e.y)))
-        c.bind("<Leave>", lambda e: self.update(CENTER, CENTER))
-        root.protocol("WM_DELETE_WINDOW", self.close)
-        self.update(CENTER, CENTER)
-
-    def make_motor(self, y, name, enable_pin, pin_a, pin_b):
-        """Draw one motor's readout block. Returns its canvas items."""
-        c = self.canvas
-        c.create_text(PANEL, y, text=name, anchor="w",
-                      font=("Helvetica", 13, "bold"))
-        direction = c.create_text(PANEL + 150, y, anchor="w",
-                                  font=("Helvetica", 13, "bold"))
-        bar_y = y + 32
-        c.create_text(PANEL, bar_y, anchor="w",
-                      text=f"PWM (pin {enable_pin})")
-        c.create_rectangle(BAR_LEFT, bar_y - 9, BAR_RIGHT, bar_y + 9,
-                           fill="#eeeeee", outline="")
-        bar = c.create_rectangle(BAR_LEFT, bar_y - 9, BAR_LEFT, bar_y + 9,
-                                 outline="")
-        number = c.create_text(BAR_RIGHT + 10, bar_y, anchor="w",
-                               font=("Courier", 13))
-        pins = c.create_text(PANEL, y + 62, anchor="w",
-                             font=("Courier", 12), fill="#444")
-        return {"direction": direction, "bar": bar, "number": number,
-                "pins": pins, "bar_y": bar_y, "pin_a": pin_a, "pin_b": pin_b}
-
-    def show_motor(self, items, speed):
-        in_a, in_b, pwm = motor_signals(speed)   # <-- the code under test
-
-        if speed > 0:
-            word, color = "FORWARD", "#2e7d32"
-        elif speed < 0:
-            word, color = "REVERSE", "#c0392b"
-        else:
-            word, color = "STOPPED", "#555555"
-
-        c = self.canvas
-        y = items["bar_y"]
-        bar_right = BAR_LEFT + pwm / 255 * (BAR_RIGHT - BAR_LEFT)
-        c.itemconfig(items["direction"], text=word, fill=color)
-        c.coords(items["bar"], BAR_LEFT, y - 9, bar_right, y + 9)
-        c.itemconfig(items["bar"], fill=color)
-        c.itemconfig(items["number"], text=f"{pwm:3d} / 255")
-        level = {1: "HIGH", 0: "LOW "}
-        c.itemconfig(items["pins"], text=(
-            f"pin {items['pin_a']}: {level[in_a]}   "
-            f"pin {items['pin_b']}: {level[in_b]}"))
-
-    def update(self, x_reading, y_reading):
-        left_speed, right_speed = mix(x_reading, y_reading)  # <-- under test
-
-        c = self.canvas
-        px, py = readings_to_pointer(x_reading, y_reading)
-        c.coords(self.marker, px - 9, py - 9, px + 9, py + 9)
-        c.itemconfig(self.result, text=describe(left_speed, right_speed))
-        c.itemconfig(self.readings,
-                     text=f"X (A5): {x_reading:4d}    Y (A4): {y_reading:4d}")
-        self.show_motor(self.left, left_speed)
-        self.show_motor(self.right, right_speed)
-
-        self.send(left_speed, right_speed)
-
-    def send(self, left_speed, right_speed):
-        """Write to the real motor driver, only when the speeds change."""
-        if self.drive is None or (left_speed, right_speed) == self.last_sent:
-            return
-        self.drive(left_speed, right_speed)
-        self.last_sent = (left_speed, right_speed)
-
-    def close(self):
-        """Stop both motors before the window goes away."""
-        if self.board is not None:
-            self.send(0, 0)
-            self.board.exit()
-            self.board = self.drive = None
-        self.root.destroy()
+    return read_joystick, drive, close
 
 
 def main():
-    root = tk.Tk()
-    tester = Tester(root, use_board="--board" in sys.argv)
+    read_joystick, drive, close = connect()
+
     try:
-        root.mainloop()
+        # loop()
+        while True:
+            x_reading, y_reading = read_joystick()
+            drive(*mix(x_reading, y_reading))
+            time.sleep(LOOP_DELAY)
+
     except KeyboardInterrupt:
         pass
     finally:
-        if tester.board is not None:
-            tester.close()
+        # Always stop both motors when the script ends
+        drive(0, 0)
+        close()
 
 
 if __name__ == "__main__":
