@@ -135,10 +135,13 @@ def connect():
              PWMOutputDevice(ENB, frequency=PWM_FREQUENCY))
 
     def read_joystick():
+        print("reading joystick...")
         # gpiozero gives 0.0-1.0; scale back to 0-1023 like analogRead()
         return round(joy_x.value * 1023), round(joy_y.value * 1023)
 
     def drive(left_speed, right_speed):
+        print("driving (writing info to pins)...")
+
         for speed, (pin_a, pin_b, enable) in ((left_speed, left),
                                               (right_speed, right)):
             in_a, in_b, pwm = motor_signals(speed)
