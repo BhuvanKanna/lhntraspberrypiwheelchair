@@ -45,8 +45,6 @@ Wiring (BCM GPIO numbers, physical header pin in [brackets]):
 
 import time
 
-from gpiozero import MCP3008, DigitalOutputDevice, PWMOutputDevice
-
 # --- Pin Definitions (BCM GPIO numbers) ---
 # Joystick (MCP3008 input channels)
 VRX_CHANNEL = 0
@@ -123,6 +121,10 @@ def connect():
       drive(left_speed, right_speed) sends direction and PWM to both motors
       close() releases all the GPIO pins
     """
+    # Imported here (not at the top) so the trackpad tester can use mix()
+    # and motor_signals() on a laptop that doesn't have gpiozero.
+    from gpiozero import MCP3008, DigitalOutputDevice, PWMOutputDevice
+
     # setup(): same roles as pinMode in the sketch
     joy_x = MCP3008(channel=VRX_CHANNEL)
     joy_y = MCP3008(channel=VRY_CHANNEL)
