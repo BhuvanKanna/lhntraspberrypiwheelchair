@@ -1,42 +1,70 @@
 """
-A joystick drives two motors (Sketch 2) -- Python version of the .ino sketch.
+A joystick drives two motors (Sketch 2) -- Raspberry Pi 4 version.
 
 The Y axis sets forward and back. The X axis steers. Mixing the two gives
 each motor its own speed:  left = y + x,  right = y - x.
 
-Python runs on your computer (or a Raspberry Pi) and talks to the Arduino
-over USB using the Firmata protocol.
+This version runs entirely on the Raspberry Pi -- no Arduino needed. The Pi
+drives the motor driver (L298N or similar) straight from its GPIO pins.
+
+The Pi has no analog inputs, so the joystick is read through an MCP3008
+analog-to-digital converter (ADC) over SPI. The MCP3008 is 10-bit, so its
+readings run 0-1023, exactly like the Arduino's analogRead(). That means the
+mixing math below is unchanged from the Arduino version.
 
 One-time setup:
-  1. In the Arduino IDE: File > Examples > Firmata > StandardFirmata,
-     then upload it to the board.
-  2. On your computer:  pip install pyfirmata2
-  3. Run:               python two_motor_control.py
+  1. Turn on SPI:  sudo raspi-config  >  Interface Options  >  SPI  >  Yes
+                   then reboot.
+  2. gpiozero comes with Raspberry Pi OS. If it's missing:
+                   sudo apt install python3-gpiozero
+  3. Run:          python3 two_motor_control_pi.py
 
-Wiring is unchanged from the .ino sketch.
+Wiring (BCM GPIO numbers, physical header pin in [brackets]):
+
+  MCP3008 (chip pin)        Raspberry Pi
+    VDD  (16), VREF (15)  ->  3.3V            [1]
+    AGND (14), DGND (9)   ->  GND             [6]
+    CLK  (13)             ->  GPIO11 / SCLK   [23]
+    DOUT (12)             ->  GPIO9  / MISO   [21]
+    DIN  (11)             ->  GPIO10 / MOSI   [19]
+    CS   (10)             ->  GPIO8  / CE0    [24]
+
+  Joystick
+    VCC (+5V)             ->  3.3V            [17]   <-- 3.3V, NOT 5V
+    GND                   ->  GND             [9]
+    VRx                   ->  MCP3008 CH0 (chip pin 1)
+    VRy                   ->  MCP3008 CH1 (chip pin 2)
+
+  Motor driver (L298N)
+    IN1 -> GPIO17 [11]     IN2 -> GPIO27 [13]     ENA -> GPIO12 [32]
+    IN3 -> GPIO22 [15]     IN4 -> GPIO23 [16]     ENB -> GPIO13 [33]
+    GND -> any Pi GND (the Pi and the driver MUST share ground)
+    Motor power (12V / VS) comes from a battery pack, never from the Pi.
+    Remove the ENA and ENB jumpers on the L298N so the Pi controls speed.
 """
 
 import time
 
-# --- Pin Definitions ---
-# Joystick
-VRX = 5              # A5
-VRY = 4              # A4
+from gpiozero import MCP3008, DigitalOutputDevice, PWMOutputDevice
+
+# --- Pin Definitions (BCM GPIO numbers) ---
+# Joystick (MCP3008 input channels)
+VRX_CHANNEL = 0
+VRY_CHANNEL = 1
 
 # Motor A (Left)
-IN1 = 10
-IN2 = 9
-ENA = 11
+IN1 = 17
+IN2 = 27
+ENA = 12
 
 # Motor B (Right)
-IN3 = 5
-IN4 = 4
-ENB = 3
+IN3 = 22
+IN4 = 23
+ENB = 13
 
 # --- Constants ---
 DEADZONE = 80        # Ignore tiny joystick noise
-
-PORT = None          # None = auto-detect. Or set e.g. "COM3" or "/dev/ttyACM0"
+PWM_FREQUENCY = 500  # Hz, close to the Arduino's 490 Hz on pins 3 and 11
 LOOP_DELAY = 0.01    # seconds between updates, same as delay(10)
 
 
@@ -88,59 +116,49 @@ def motor_signals(speed):
 
 
 def connect():
-    """Connect to the Arduino and set up the motor pins.
+    """Set up the joystick ADC and the motor pins.
 
-    Returns (board, drive), where drive(left_speed, right_speed) sends
-    the direction and PWM signals for both motors.
+    Returns (read_joystick, drive, close):
+      read_joystick() -> (x_reading, y_reading), each 0-1023
+      drive(left_speed, right_speed) sends direction and PWM to both motors
+      close() releases all the GPIO pins
     """
-    from pyfirmata2 import Arduino
-
-    board = Arduino(PORT or Arduino.AUTODETECT)
-
     # setup(): same roles as pinMode in the sketch
-    left = (board.get_pin(f"d:{IN1}:o"), board.get_pin(f"d:{IN2}:o"),
-            board.get_pin(f"d:{ENA}:p"))
-    right = (board.get_pin(f"d:{IN3}:o"), board.get_pin(f"d:{IN4}:o"),
-             board.get_pin(f"d:{ENB}:p"))
+    joy_x = MCP3008(channel=VRX_CHANNEL)
+    joy_y = MCP3008(channel=VRY_CHANNEL)
+
+    left = (DigitalOutputDevice(IN1), DigitalOutputDevice(IN2),
+            PWMOutputDevice(ENA, frequency=PWM_FREQUENCY))
+    right = (DigitalOutputDevice(IN3), DigitalOutputDevice(IN4),
+             PWMOutputDevice(ENB, frequency=PWM_FREQUENCY))
+
+    def read_joystick():
+        # gpiozero gives 0.0-1.0; scale back to 0-1023 like analogRead()
+        return round(joy_x.value * 1023), round(joy_y.value * 1023)
 
     def drive(left_speed, right_speed):
         for speed, (pin_a, pin_b, enable) in ((left_speed, left),
                                               (right_speed, right)):
             in_a, in_b, pwm = motor_signals(speed)
-            pin_a.write(in_a)
-            pin_b.write(in_b)
-            enable.write(pwm / 255)   # Firmata PWM takes 0.0-1.0
+            pin_a.value = in_a
+            pin_b.value = in_b
+            enable.value = pwm / 255   # gpiozero PWM takes 0.0-1.0
 
-    return board, drive
+    def close():
+        for device in (joy_x, joy_y, *left, *right):
+            device.close()
+
+    return read_joystick, drive, close
 
 
 def main():
-    board, drive = connect()
-    board.samplingOn(10)  # report analog readings every 10 ms
-
-    # pyfirmata2 delivers analog readings through callbacks, so keep the
-    # most recent ones here for the loop to use.
-    latest = {"x": None, "y": None}   # 0.0-1.0, or None before first sample
-
-    def on_x(value):
-        latest["x"] = value
-
-    def on_y(value):
-        latest["y"] = value
-
-    board.get_pin(f"a:{VRX}:i").register_callback(on_x)
-    board.get_pin(f"a:{VRY}:i").register_callback(on_y)
+    read_joystick, drive, close = connect()
 
     try:
         # loop()
         while True:
-            if latest["x"] is None or latest["y"] is None:
-                drive(0, 0)
-            else:
-                x_reading = round(latest["x"] * 1023)  # back to 0-1023
-                y_reading = round(latest["y"] * 1023)
-                drive(*mix(x_reading, y_reading))
-
+            x_reading, y_reading = read_joystick()
+            drive(*mix(x_reading, y_reading))
             time.sleep(LOOP_DELAY)
 
     except KeyboardInterrupt:
@@ -148,7 +166,7 @@ def main():
     finally:
         # Always stop both motors when the script ends
         drive(0, 0)
-        board.exit()
+        close()
 
 
 if __name__ == "__main__":
